@@ -1,4 +1,4 @@
-Name,Symbol,Date,Sedol,Returns,MktCap,Global,Region,Market,GICSL1,GICSL2,GICSL3,GICSL4,Fin_REIT,Coverage,12MFEY,12MTEY,3M-1MPmom,12M-1MPmom
+Name,Symbol,Date,Sedol,Returns,MktCap,Global,Region,Market,GICSL1,GICSL2,GICSL3,GICSL4,Fin_REIT,Coverage,12MFEY,12MTBY,3M-1MPmom,12M-1MPmom
 GE Vernova Inc.,US36828A1016,12/31/2023,BP6H4Y1,,,Global,North America,United States,Industrials,Capital Goods,Electrical Equipment,Heavy Electrical Equipment,0,0,,,,
 Solventum Corporation,US83444M1018,12/31/2023,BMTQB43,,,Global,North America,United States,Health Care,Health Care Equipment & Services,Health Care Equipment & Supplies,Health Care Supplies,0,0,,,,
 Apple Inc.,US0378331005,12/31/2023,2046251,-4.22,"2,994,371",Global,North America,United States,Information Technology,Technology Hardware & Equipment,Technology Hardware Storage & Peripherals,Technology Hardware Storage & Peripherals,0,0,3.47,2.14,11.09,46.93
