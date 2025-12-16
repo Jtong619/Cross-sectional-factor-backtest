@@ -301,7 +301,7 @@ Market Regime Assessment: {market_regime}
     # Single unified write-up (3 bullet points)
     writeup = f"""- US styles have witnessed significant volatility in Q4, led by {best_4q[0]}, followed by {second_best}, while {worst_4q[0]} has underperformed significantly, highlighting strong market risk-on appetite, favoring growth-oriented strategy.
 - However, the market preference on GARP and Value at the expense of Growth also reflects investor preference on capturing growth exposure at a reasonable price.
-- Also, US growth and low-risk style returns have diverged significantly since the "Liberation Day", suggesting that defensive styles such as LowRisk and Quality could remain under pressure with liquidity and macro tailwinds in play next year."""
+- The significant divergence between growth and low-risk style returns since 'Liberation Day' suggests that macro events continue to drive US equity style performance, and investors should remain alert to policy and liquidity shifts."""
 
     # --- AI WRITE-UP (optional - set USE_AI_WRITEUPS_PAGE1 = True to enable) ---
     if USE_AI_WRITEUPS_PAGE1 and client:
