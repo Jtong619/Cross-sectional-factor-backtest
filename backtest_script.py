@@ -587,6 +587,12 @@ except:
         plt.style.use('ggplot')
 
 exhibit_num = 1
+
+# Footer function for all PDF pages
+def add_footer(fig):
+    fig.text(0.5, 0.01, 'Jeffrey Tong, CFA | Jeffrey.hk.tong@outlook.com | github.com/jtong619', 
+             ha='center', fontsize=7, color='gray', style='italic')
+
 with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     
     # ==========================================================================
@@ -816,6 +822,7 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
              fontsize=9, fontweight='bold', ha='left')
     fig.text(line_left3, pos3.y0 - 0.09, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
     
+    add_footer(fig)
     pdf.savefig(fig)
     plt.close()
     print(" → Added summary page 1")
@@ -1014,6 +1021,7 @@ Start each bullet with a dash. Be concise."""
              fontsize=9, fontweight='bold', ha='left')
     fig2.text(line_left3, pos3.y0 - 0.09, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
     
+    add_footer(fig2)
     pdf.savefig(fig2)
     plt.close()
     print(" → Added summary page 2")
@@ -1225,6 +1233,7 @@ Start each bullet with a dash. Be concise."""
     fig3.text(0.06, 0.06, 'Source: FactSet, S&P 500 data. Sector avg return = simple average of all stock-month observations in Q1.', 
              fontsize=6, ha='left', style='italic')
     
+    add_footer(fig3)
     pdf.savefig(fig3)
     plt.close()
     print(" → Added Q4 attribution page")
@@ -1315,6 +1324,7 @@ Start each bullet with a dash. Be concise."""
             # Source footer
             fig_def.text(0.06, 0.06, 'Source: FactSet', fontsize=6, ha='left', style='italic')
             
+            add_footer(fig_def)
             pdf.savefig(fig_def)
             plt.close()
             print(" → Added factor definitions page")
@@ -1514,6 +1524,7 @@ Start each bullet with a dash. Be concise."""
         fig.text(line_left6, pos6.y1 + 0.005, f'Exhibit {exhibit_num + 5}: Q1 vs Q5 Monthly Returns (Last 12M)', fontsize=8, fontweight='bold', ha='left')
         fig.text(line_left6, pos6.y0 - 0.05, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
 
+        add_footer(fig)
         pdf.savefig(fig)
         plt.close()
         print(f" → Added page for: {factor}")
