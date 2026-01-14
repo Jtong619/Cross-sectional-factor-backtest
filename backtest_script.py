@@ -23,49 +23,23 @@ import warnings
 import os
 warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
 
-# --- OpenAI Client (optional - only needed if USE_AI_WRITEUPS is True) ---
-client = None
-try:
-    from openai import OpenAI
-    api_key = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if api_key:
-        client = OpenAI(
-            api_key=api_key,
-            base_url=os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
-        )
-except ImportError:
-    pass  # OpenAI not installed - AI write-ups will be skipped
-
 # =============================================================================
-# 1. CONFIGURATION
+# CONFIGURATION
 # =============================================================================
 
-# --- Data Settings ---
 DATA_FILE = 'data/SP500_factor_data.csv'
 ANALYST_NEEDED = 1
 
-# --- Quintile/Fractile Settings ---
-NUM_GROUPS = 5                # Number of buckets (quintiles = 5)
-MIN_STOCKS = 10               # Minimum stocks per group to include a date
-HIGHER_BETTER = True          # True = high factor value → Q1 (best)
+NUM_GROUPS = 5
+MIN_STOCKS = 10
+HIGHER_BETTER = True
 
-# --- Reference Columns (not treated as factors) ---
 REFERENCE_COLS = ['Name', 'Symbol', 'Date', 'Sedol', 'Returns', 'Weight', 'MktCap',
                   'Global', 'Region', 'Market', 'GICSL1', 'GICSL2', 'GICSL3', 'GICSL4',
                   'Fin_FLAG', 'REIT_FLAG', 'Coverage']
 
-# --- Ex-Finance Factors (use non-financial universe for turnover) ---
 EX_FINANCE_FACTORS = ['12MFFCFY', 'ROIC', 'FCFConv']
 
-# --- Write-up Settings ---
-USE_AI_WRITEUPS_PAGE1 = False  # Page 1: False = manual write-up, True = AI-generated
-USE_AI_WRITEUPS_PAGE2 = False  # Page 2: False = template-based, True = AI-generated
-
-# --- Multi-Factor Rating (MFR) Definitions ---
-# Each MFR is an equal-weighted average of z-scores
-#   - 'required': Factors that MUST have data (no MFR if any missing)
-#   - 'optional': Factors included if available (for all stocks)
-#   - 'nonfin_only': Factors included ONLY for non-financial stocks (Fin_FLAG != 1)
 MFR_DEFINITIONS = {
     'Value': {
         'required': ['12MFEY', '12MTBY'],
@@ -110,7 +84,7 @@ MFR_DEFINITIONS = {
 }
 
 # =============================================================================
-# 2. HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # =============================================================================
 
 def has_sufficient_data(series, n_months=None, min_coverage=0.90):
@@ -170,14 +144,6 @@ def prepare_factor_data(df, factor, num_groups=NUM_GROUPS, min_stocks=MIN_STOCKS
     
     Returns:
         tuple: (monthly_returns, universe_returns, stock_data) or (None, None, None) if insufficient data
-        
-    Parameters:
-        df: DataFrame with stock data
-        factor: Factor column name
-        num_groups: Number of quintile groups
-        min_stocks: Minimum stocks per group
-        higher_better: Whether higher factor values are better
-        shift_dates: If True, shift dates by 1 month for display purposes
     """
     cols = ['Date', 'Symbol', 'Returns', factor]
     temp = df[cols].dropna().copy()
@@ -188,22 +154,17 @@ def prepare_factor_data(df, factor, num_groups=NUM_GROUPS, min_stocks=MIN_STOCKS
     if temp.empty:
         return None, None, None
     
-    # Ranking using PERCENTRANK approach (handles ties properly)
     temp['PctRank'] = temp.groupby('Date')[factor].transform(
         lambda x: x.rank(pct=True, method='average')
     )
     
-    # Assign quintiles based on fixed percentile cutoffs
     temp['Group'] = temp['PctRank'].apply(lambda x: assign_quintile(x, higher_better))
     
-    # Aggregate to monthly quintile returns
     monthly = temp.pivot_table(index='Date', columns='Group', values='Returns', aggfunc='mean')
     monthly = monthly.reindex(columns=[f'Q{i}' for i in range(1, num_groups + 1)])
     
-    # Universe (factor-available stocks) returns
     universe = temp.groupby('Date')['Returns'].mean()
     
-    # Optionally shift dates (for display: factor date → return date)
     if shift_dates:
         monthly.index = monthly.index + pd.offsets.MonthEnd(1)
         universe.index = universe.index + pd.offsets.MonthEnd(1)
@@ -229,6 +190,122 @@ def calc_turnover(members_series):
             turnover.append((in_new + out_old) / len(prev_set))
 
     return pd.Series(turnover, index=dates).mean() * 12
+
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+
+def load_data(data_file=DATA_FILE, analyst_needed=ANALYST_NEEDED):
+    """
+    Load and preprocess stock factor data.
+    
+    Returns:
+        tuple: (df, factors) - DataFrame and list of factor column names
+    """
+    print("Loading data...")
+    df = pd.read_csv(data_file, parse_dates=['Date'])
+    df = df[df['Coverage'] == analyst_needed]
+    df['Returns'] = df['Returns'] / 100
+    
+    factors = [c for c in df.columns if c not in REFERENCE_COLS]
+    
+    return df, factors
+
+
+def construct_mfrs(df, factors):
+    """
+    Construct Multi-Factor Ratings (MFRs) from individual factors.
+    
+    Returns:
+        tuple: (df, factors, mfr_names, individual_factors)
+    """
+    print("Constructing MFRs...")
+    
+    zscore_df = pd.DataFrame(index=df.index)
+    for factor in factors:
+        zscore_df[factor] = df.groupby('Date')[factor].transform(calc_zscore)
+    
+    is_financial = df['Fin_FLAG'] == 1
+    
+    for mfr_name, config in MFR_DEFINITIONS.items():
+        required = config['required']
+        optional = config.get('optional', [])
+        nonfin_only = config.get('nonfin_only', [])
+        
+        required_mask = pd.Series(True, index=df.index)
+        for f in required:
+            if f in zscore_df.columns:
+                required_mask &= zscore_df[f].notna()
+            else:
+                required_mask = pd.Series(False, index=df.index)
+                break
+        
+        z_sum = pd.Series(0.0, index=df.index)
+        z_count = pd.Series(0, index=df.index)
+        
+        for f in required:
+            if f in zscore_df.columns:
+                mask = zscore_df[f].notna()
+                z_sum = z_sum.where(~mask, z_sum + zscore_df[f].fillna(0))
+                z_count = z_count.where(~mask, z_count + 1)
+        
+        for f in optional:
+            if f in zscore_df.columns:
+                mask = zscore_df[f].notna()
+                z_sum = z_sum.where(~mask, z_sum + zscore_df[f].fillna(0))
+                z_count = z_count.where(~mask, z_count + 1)
+        
+        for f in nonfin_only:
+            if f in zscore_df.columns:
+                mask = zscore_df[f].notna() & ~is_financial
+                z_sum = z_sum.where(~mask, z_sum + zscore_df[f].fillna(0))
+                z_count = z_count.where(~mask, z_count + 1)
+        
+        mfr_scores = z_sum / z_count
+        mfr_scores = mfr_scores.where(required_mask, np.nan)
+        df[mfr_name] = mfr_scores
+    
+    mfr_names = list(MFR_DEFINITIONS.keys())
+    individual_factors = factors.copy()
+    factors = mfr_names + individual_factors
+    
+    print(f"Found {len(factors)} factors (including {len(mfr_names)} MFRs).")
+    
+    return df, factors, mfr_names, individual_factors
+
+
+def get_factor_data():
+    """
+    Convenience function to load data and construct MFRs in one call.
+    
+    Returns:
+        tuple: (df, factors, mfr_names, individual_factors)
+    """
+    df, factors = load_data()
+    return construct_mfrs(df, factors)
+
+
+# --- OpenAI Client (optional - only needed if USE_AI_WRITEUPS is True) ---
+client = None
+try:
+    from openai import OpenAI
+    api_key = os.environ.get("AI_INTEGRATIONS_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        client = OpenAI(
+            api_key=api_key,
+            base_url=os.environ.get("AI_INTEGRATIONS_OPENAI_BASE_URL")
+        )
+except ImportError:
+    pass  # OpenAI not installed - AI write-ups will be skipped
+
+# =============================================================================
+# 1. CONFIGURATION (backtest-specific settings)
+# =============================================================================
+
+# --- Write-up Settings ---
+USE_AI_WRITEUPS_PAGE1 = False  # Page 1: False = manual write-up, True = AI-generated
+USE_AI_WRITEUPS_PAGE2 = False  # Page 2: False = template-based, True = AI-generated
 
 
 def generate_style_writeup(style_4q_opf, style_ytd_opf, df, mfr_names, current_year):
@@ -299,9 +376,9 @@ Market Regime Assessment: {market_regime}
     second_best = sorted_4q[1][0] if len(sorted_4q) > 1 else 'Value'
     
     # Single unified write-up (3 bullet points)
-    writeup = f"""- US styles have witnessed significant volatility in Q4, led by {best_4q[0]}, followed by {second_best}, while {worst_4q[0]} has underperformed significantly, highlighting strong market risk-on appetite, favoring growth-oriented strategy.
-- However, the market preference on GARP and Value at the expense of Growth also reflects investor preference on capturing growth exposure at a reasonable price.
-- The significant divergence between growth and low-risk style returns since 'Liberation Day' suggests that macro events continue to drive US equity style performance, and investors should remain alert to policy and liquidity shifts."""
+    writeup = f"""- Strong risk-on appetite persists into 2026, with GARP, Growth, and Revision styles leading. In contrast, {worst_4q[0]} and Quality lag significantly.
+- The preference for GARP over pure Growth reflects investors seeking growth exposure at reasonable valuations.
+- The persistent divergence between growth and defensive styles suggests macro factors remain key drivers of US equity performance; stay alert to policy and liquidity shifts."""
 
     # --- AI WRITE-UP (optional - set USE_AI_WRITEUPS_PAGE1 = True to enable) ---
     if USE_AI_WRITEUPS_PAGE1 and client:
@@ -325,78 +402,10 @@ Write 5 bullet points analyzing style performance. Target 120 words total. Start
 
 
 # =============================================================================
-# 3. LOAD DATA
+# 3. LOAD DATA AND CONSTRUCT MFRs (using shared data_loader)
 # =============================================================================
-print("Loading data...")
-df = pd.read_csv(DATA_FILE, parse_dates=['Date'])
-df = df[df['Coverage'] == ANALYST_NEEDED]
-df['Returns'] = df['Returns'] / 100
-
-factors = [c for c in df.columns if c not in REFERENCE_COLS]
-
-# =============================================================================
-# 4. CONSTRUCT MULTI-FACTOR RATINGS (MFRs)
-# =============================================================================
-print("Constructing MFRs...")
-
-# Calculate z-scores for all factors by month (vectorized)
-zscore_df = pd.DataFrame(index=df.index)
-for factor in factors:
-    zscore_df[factor] = df.groupby('Date')[factor].transform(calc_zscore)
-
-# Create MFR columns
-is_financial = df['Fin_FLAG'] == 1
-
-for mfr_name, config in MFR_DEFINITIONS.items():
-    required = config['required']
-    optional = config.get('optional', [])
-    nonfin_only = config.get('nonfin_only', [])
-    
-    # Check if all required factors have data
-    required_mask = pd.Series(True, index=df.index)
-    for f in required:
-        if f in zscore_df.columns:
-            required_mask &= zscore_df[f].notna()
-        else:
-            required_mask = pd.Series(False, index=df.index)
-            break
-    
-    # Sum z-scores and count for averaging
-    z_sum = pd.Series(0.0, index=df.index)
-    z_count = pd.Series(0, index=df.index)
-    
-    # Add required factors
-    for f in required:
-        if f in zscore_df.columns:
-            mask = zscore_df[f].notna()
-            z_sum = z_sum.where(~mask, z_sum + zscore_df[f].fillna(0))
-            z_count = z_count.where(~mask, z_count + 1)
-    
-    # Add optional factors (for all stocks)
-    for f in optional:
-        if f in zscore_df.columns:
-            mask = zscore_df[f].notna()
-            z_sum = z_sum.where(~mask, z_sum + zscore_df[f].fillna(0))
-            z_count = z_count.where(~mask, z_count + 1)
-    
-    # Add non-financial only factors
-    for f in nonfin_only:
-        if f in zscore_df.columns:
-            mask = zscore_df[f].notna() & ~is_financial
-            z_sum = z_sum.where(~mask, z_sum + zscore_df[f].fillna(0))
-            z_count = z_count.where(~mask, z_count + 1)
-    
-    # Calculate MFR as average z-score where required factors are available
-    mfr_scores = z_sum / z_count
-    mfr_scores = mfr_scores.where(required_mask, np.nan)
-    df[mfr_name] = mfr_scores
-
-# Add MFRs to factors list (MFRs first for PDF ordering)
-mfr_names = list(MFR_DEFINITIONS.keys())
-individual_factors = factors.copy()
-factors = mfr_names + individual_factors
-
-print(f"Found {len(factors)} factors (including {len(mfr_names)} MFRs). Starting backtest...")
+df, factors, mfr_names, individual_factors = get_factor_data()
+print("Starting backtest...")
 
 # =============================================================================
 # 5. MAIN BACKTEST LOOP - EXCEL OUTPUT
@@ -576,6 +585,8 @@ with pd.ExcelWriter('Backtest_Results.xlsx', engine='openpyxl') as writer:
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.lines import Line2D
+import textwrap
 
 # Use a style that works across matplotlib versions
 try:
@@ -586,118 +597,189 @@ except:
     except:
         plt.style.use('ggplot')
 
-exhibit_num = 1
-
-# Footer function for all PDF pages
+# --- Helper Functions for Chart Formatting ---
 def add_footer(fig):
     fig.text(0.5, 0.01, 'Jeffrey Tong, CFA | Jeffrey.hk.tong@outlook.com | github.com/jtong619', 
              ha='center', fontsize=7, color='gray', style='italic')
+
+def add_chart_frame(fig, ax, title, source='Source: FactSet, S&P 500 data', bottom_offset=0.05):
+    pos = ax.get_position()
+    line_left = pos.x0 - 0.02
+    line_right = pos.x1 + 0.02
+    fig.add_artist(plt.Line2D([line_left, line_right], [pos.y1 + 0.02, pos.y1 + 0.02], 
+                              color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
+    fig.add_artist(plt.Line2D([line_left, line_right], [pos.y0 - bottom_offset, pos.y0 - bottom_offset], 
+                              color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
+    fig.text(line_left, pos.y1 + 0.025, title, fontsize=9, fontweight='bold', ha='left')
+    fig.text(line_left, pos.y0 - bottom_offset - 0.01, source, fontsize=6, ha='left', style='italic')
+    return line_left, line_right
+
+def style_axis(ax, remove_spines=True, grid=False):
+    ax.grid(grid)
+    if remove_spines:
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+def get_valid_range(vals):
+    valid = [v for v in vals if not np.isnan(v)]
+    if not valid:
+        return 0.1
+    return max(abs(min(valid)), abs(max(valid))) * 1.15
+
+# --- Dynamic Date Calculation Based on Data ---
+# Get all dates from data (using shifted dates for display)
+sample_monthly, _, _ = prepare_factor_data(df, factors[0], shift_dates=True)
+all_dates = sample_monthly.index if sample_monthly is not None else pd.DatetimeIndex([])
+data_max_date = all_dates.max() if len(all_dates) > 0 else pd.Timestamp.today()
+data_min_date = all_dates.min() if len(all_dates) > 0 else pd.Timestamp('2021-01-01')
+
+# Current period = latest year in data, Previous period = year before that
+latest_year = data_max_date.year
+prev_year = latest_year - 1 if data_max_date.month >= 1 else latest_year - 2
+prev_year_start = pd.Timestamp(f'{prev_year}-01-01')
+prev_year_end = pd.Timestamp(f'{prev_year}-12-31')
+ytd_start = pd.Timestamp(f'{latest_year}-01-01')
+
+# Long-term analysis: 4 years back from data start or min available
+longterm_years_back = 4
+longterm_start = max(data_min_date, pd.Timestamp(f'{latest_year - longterm_years_back}-01-01'))
+shortterm_years_back = 2
+shortterm_start = max(data_min_date, pd.Timestamp(f'{latest_year - shortterm_years_back}-01-01'))
+
+# Q4 dates (dynamic based on prev_year)
+q4_months = [9, 10, 11]  # Sep, Oct, Nov factor dates -> Oct, Nov, Dec returns
+q4_raw_dates = pd.to_datetime([f'{prev_year}-{m:02d}-{pd.Timestamp(f"{prev_year}-{m:02d}-01").days_in_month}' 
+                               for m in q4_months])
+
+print(f" → Data range: {data_min_date.strftime('%b %Y')} to {data_max_date.strftime('%b %Y')}")
+print(f" → Front page: YTD'{str(latest_year)[-2:]} (bars) vs {prev_year} (dots)")
+print(f" → Long-term analysis since: {longterm_start.strftime('%b %Y')}")
+
+# --- Pre-compute All Factor Performance Data (Single Loop) ---
+factor_data_cache = {}
+style_prev_year_opf = {}
+style_ytd_opf = {}
+style_cum_shortterm = {}
+style_cum_longterm = {}
+style_hitrate = {}
+factor_prev_year_opf = {}
+factor_ytd_opf = {}
+factor_ann_opf = {}
+factor_monthly_opf = {}
+factor_q1_members = {}
+
+for factor in factors:
+    monthly, universe, temp = prepare_factor_data(df, factor, shift_dates=True)
+    if monthly is None:
+        continue
+    
+    # Cache for later use
+    factor_data_cache[factor] = {'monthly': monthly, 'universe': universe, 'temp': temp}
+    
+    # Q1-Q5 spread
+    q1_q5 = monthly['Q1'] - monthly['Q5']
+    
+    # Previous year data (dots)
+    prev_year_data = q1_q5[(q1_q5.index >= prev_year_start) & (q1_q5.index <= prev_year_end)]
+    # YTD data (bars)
+    ytd_data = q1_q5[q1_q5.index >= ytd_start]
+    # Long-term data
+    longterm_data = q1_q5[q1_q5.index >= longterm_start]
+    # Short-term data (for page 1 cumulative chart)
+    shortterm_data = q1_q5[q1_q5.index >= shortterm_start]
+    
+    # Calculate cumulative OPF for periods
+    prev_year_opf = (1 + prev_year_data).prod() - 1 if len(prev_year_data) > 0 else np.nan
+    ytd_opf = (1 + ytd_data).prod() - 1 if len(ytd_data) > 0 else np.nan
+    
+    if factor in mfr_names:
+        style_prev_year_opf[factor] = prev_year_opf
+        style_ytd_opf[factor] = ytd_opf
+        
+        # Short-term cumulative (for page 1)
+        if len(shortterm_data) > 0:
+            cum = (1 + shortterm_data).cumprod() - 1
+            start_pt = pd.Series([0.0], index=[shortterm_data.index.min() - pd.offsets.MonthEnd(1)])
+            style_cum_shortterm[factor] = pd.concat([start_pt, cum])
+        
+        # Long-term cumulative (for page 2)
+        if len(longterm_data) > 0:
+            cum = (1 + longterm_data).cumprod() - 1
+            start_pt = pd.Series([0.0], index=[longterm_data.index.min() - pd.offsets.MonthEnd(1)])
+            style_cum_longterm[factor] = pd.concat([start_pt, cum])
+            style_hitrate[factor] = (longterm_data > 0).mean()
+    else:
+        factor_prev_year_opf[factor] = prev_year_opf
+        factor_ytd_opf[factor] = ytd_opf
+        factor_monthly_opf[factor] = q1_q5
+        
+        # Annualized OPF (long-term)
+        if len(longterm_data) >= 12:
+            total_return = (1 + longterm_data).prod() - 1
+            n_years = len(longterm_data) / 12
+            factor_ann_opf[factor] = (1 + total_return) ** (1 / n_years) - 1
+        
+        # Q1 members for overlap calculation
+        factor_q1_members[factor] = temp[temp['Group'] == 'Q1'].groupby('Date')['Symbol'].apply(set)
+
+# --- Generate Write-up ---
+print(" → Generating write-up for summary page...")
+summary_writeup = generate_style_writeup(
+    style_prev_year_opf, style_ytd_opf, df, mfr_names, prev_year
+)
+
+# --- Dynamic Labels ---
+prev_year_label = str(prev_year)
+ytd_label = f"YTD'{str(latest_year)[-2:]}"
+shortterm_label = f"Since {shortterm_start.strftime('%b %Y')}"
+longterm_label = f"Since {longterm_start.strftime('%b %Y')}"
 
 with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     
     # ==========================================================================
     # SUMMARY PAGE 1: Style and Factor Performance Overview
     # ==========================================================================
-    
-    # Calculate Q1-Q5 OPF for 4Q'25 and 2025 for all factors
-    current_year = pd.Timestamp.today().year
-    q4_start = pd.Timestamp(f'{current_year}-10-01')
-    year_start = pd.Timestamp(f'{current_year}-01-01')
-    
-    style_4q_opf = {}
-    style_ytd_opf = {}
-    style_cum_data = {}  # For cumulative lines since 2024
-    
-    factor_4q_opf = {}
-    factor_ytd_opf = {}
-    
-    for factor in factors:
-        monthly, universe, temp = prepare_factor_data(df, factor, shift_dates=True)
-        if monthly is None:
-            continue
-        
-        # Q1-Q5 spread
-        q1_q5 = monthly['Q1'] - monthly['Q5']
-        
-        # 4Q data (Oct, Nov, Dec of current year)
-        q4_data = q1_q5[q1_q5.index >= q4_start]
-        ytd_data = q1_q5[q1_q5.index >= year_start]
-        
-        # Calculate cumulative OPF for the period
-        q4_opf = (1 + q4_data).prod() - 1 if len(q4_data) > 0 else np.nan
-        ytd_opf = (1 + ytd_data).prod() - 1 if len(ytd_data) > 0 else np.nan
-        
-        if factor in mfr_names:
-            style_4q_opf[factor] = q4_opf
-            style_ytd_opf[factor] = ytd_opf
-            
-            # Cumulative Q1-Q5 since 2024
-            since_2024 = q1_q5[q1_q5.index >= pd.Timestamp('2024-01-01')]
-            if len(since_2024) > 0:
-                cum_q1_q5 = (1 + since_2024).cumprod() - 1
-                # Add starting point at 0
-                start_date = since_2024.index.min() - pd.offsets.MonthEnd(1)
-                cum_q1_q5 = pd.concat([pd.Series([0.0], index=[start_date]), cum_q1_q5])
-                style_cum_data[factor] = cum_q1_q5
-        else:
-            factor_4q_opf[factor] = q4_opf
-            factor_ytd_opf[factor] = ytd_opf
-    
-    # --- Generate Write-up ---
-    print(" → Generating write-up for summary page...")
-    summary_writeup = generate_style_writeup(
-        style_4q_opf, style_ytd_opf, df, mfr_names, current_year
-    )
-    
-    # --- Create Summary Page 1 ---
-    from matplotlib.lines import Line2D
-    import textwrap
-    
     fig = plt.figure(figsize=(8.27, 11.69))
-    q4_label = f"Q4'{str(current_year)[-2:]}"
-    fig.text(0.06, 0.95, f'S&P 500 - Style and factor {q4_label} return summary', fontsize=14, fontweight='bold', 
+    fig.text(0.06, 0.95, f'S&P 500 - Style and factor {ytd_label} return summary', fontsize=14, fontweight='bold', 
              ha='left', color='#006d77')
     
-    # Chart 1: Style 4Q'25 and 2025 Q1-Q5 OPF (narrower to fit dual axis)
+    # Chart 1: Style YTD'26 (bars) and 2025 (dots) Q1-Q5 OPF
     ax1 = fig.add_axes([0.08, 0.72, 0.48, 0.16])  # [left, bottom, width, height]
     
-    # Sort styles by 4Q OPF (high to low)
-    sorted_styles = sorted(style_4q_opf.keys(), key=lambda s: style_4q_opf.get(s, 0), reverse=True)
+    # Sort styles by YTD OPF (high to low)
+    sorted_styles = sorted(style_ytd_opf.keys(), key=lambda s: style_ytd_opf.get(s, 0), reverse=True)
     x_pos = np.arange(len(sorted_styles))
-    q4_vals = [style_4q_opf.get(s, 0) for s in sorted_styles]
     ytd_vals = [style_ytd_opf.get(s, 0) for s in sorted_styles]
+    prev_year_vals = [style_prev_year_opf.get(s, 0) for s in sorted_styles]
     
-    # Determine if we need dual axis (different scales)
-    q4_range = max(abs(min(q4_vals)), abs(max(q4_vals))) if q4_vals else 0.1
-    ytd_range = max(abs(min(ytd_vals)), abs(max(ytd_vals))) if ytd_vals else 0.1
-    use_dual_axis = abs(q4_range - ytd_range) / max(q4_range, ytd_range) > 0.5
+    # Filter out NaN values for axis limits
+    ytd_vals_valid = [v for v in ytd_vals if not np.isnan(v)]
+    prev_year_vals_valid = [v for v in prev_year_vals if not np.isnan(v)]
     
-    bars = ax1.bar(x_pos, q4_vals, width=0.6, color='steelblue', alpha=0.8, label="4Q'25")
+    # Always use dual axis for clarity
+    bars = ax1.bar(x_pos, ytd_vals, width=0.6, color='steelblue', alpha=0.8, label=ytd_label)
     ax1.axhline(0, color='#d0d2d6', linewidth=0.8)
     ax1.set_xticks(x_pos)
     ax1.set_xticklabels(sorted_styles, rotation=90, ha='center', fontsize=7)
-    ax1.set_ylabel("4Q'25 Q1-Q5 OPF (%)", fontsize=7, color='black')
+    ax1.set_ylabel(f"{ytd_label} Q1-Q5 OPF (%)", fontsize=7, color='black')
     ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
     ax1.tick_params(axis='y', labelsize=6, colors='black')
     ax1.grid(False)
     
-    # Add dots for 2025 OPF
-    if use_dual_axis:
-        ax1b = ax1.twinx()
-        ax1b.scatter(x_pos, ytd_vals, color='darkorange', s=15, zorder=5, label='2025')
-        ax1b.set_ylabel('2025 Q1-Q5 OPF (%)', fontsize=7, color='black')
-        ax1b.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
-        ax1b.tick_params(axis='y', labelsize=6, colors='black')
-        ax1b.grid(False)
-        # Align zero on both axes with proportional scaling
-        y1_abs_max = max(abs(min(q4_vals)), abs(max(q4_vals))) * 1.15
-        y2_abs_max = max(abs(min(ytd_vals)), abs(max(ytd_vals))) * 1.15
-        ax1.set_ylim(-y1_abs_max, y1_abs_max)
-        ax1b.set_ylim(-y2_abs_max, y2_abs_max)
-        for spine in ax1b.spines.values():
-            spine.set_visible(False)
-    else:
-        ax1.scatter(x_pos, ytd_vals, color='darkorange', s=15, zorder=5, label='2025')
+    # Add dots for 2025 OPF on RHS axis
+    ax1b = ax1.twinx()
+    ax1b.scatter(x_pos, prev_year_vals, color='darkorange', s=15, zorder=5, label=prev_year_label)
+    ax1b.set_ylabel(f'{prev_year_label} Q1-Q5 OPF (%)', fontsize=7, color='black')
+    ax1b.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
+    ax1b.tick_params(axis='y', labelsize=6, colors='black')
+    ax1b.grid(False)
+    # Set appropriate y-axis limits (handle empty/NaN cases)
+    ytd_abs_max = max(abs(min(ytd_vals_valid)), abs(max(ytd_vals_valid))) * 1.15 if ytd_vals_valid else 0.1
+    prev_year_abs_max = max(abs(min(prev_year_vals_valid)), abs(max(prev_year_vals_valid))) * 1.15 if prev_year_vals_valid else 0.1
+    ax1.set_ylim(-ytd_abs_max, ytd_abs_max)
+    ax1b.set_ylim(-prev_year_abs_max, prev_year_abs_max)
+    for spine in ax1b.spines.values():
+        spine.set_visible(False)
     
     ax1.set_xlim(-0.5, len(sorted_styles) - 0.5)
     for spine in ax1.spines.values():
@@ -705,9 +787,9 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     
     
     # Legend
-    legend_elements = [plt.Rectangle((0,0),1,1, color='steelblue', alpha=0.8, label="4Q'25"),
+    legend_elements = [plt.Rectangle((0,0),1,1, color='steelblue', alpha=0.8, label=ytd_label),
                        Line2D([0], [0], marker='o', color='w', markerfacecolor='darkorange', 
-                              markersize=8, label='2025 (RHS)')]
+                              markersize=8, label=f'{prev_year_label} (RHS)')]
     ax1.legend(handles=legend_elements, loc='upper right', fontsize=6, framealpha=0.9)
     
     # Chart title and formatting lines (stop at chart margin)
@@ -716,15 +798,15 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     line_right = pos1.x1 + 0.02
     fig.add_artist(plt.Line2D([line_left, line_right], [pos1.y1 + 0.02, pos1.y1 + 0.02], color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
     fig.add_artist(plt.Line2D([line_left, line_right], [pos1.y0 - 0.05, pos1.y0 - 0.05], color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
-    fig.text(line_left, pos1.y1 + 0.025, f"Exhibit 1: Style Q1-Q5 Outperformance — 4Q'{str(current_year)[-2:]} vs {current_year}", 
+    fig.text(line_left, pos1.y1 + 0.025, f"Exhibit 1: Style Q1-Q5 Outperformance — {ytd_label} vs {prev_year_label}", 
              fontsize=9, fontweight='bold', ha='left')
     fig.text(line_left, pos1.y0 - 0.06, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
     
-    # Chart 2: Style Cumulative Q1-Q5 since 2024 (2/3 width, text on right)
+    # Chart 2: Style Cumulative Q1-Q5 (short-term, 2/3 width, text on right)
     ax2 = fig.add_axes([0.08, 0.46, 0.55, 0.16])
     
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    for i, (style, cum_data) in enumerate(style_cum_data.items()):
+    for i, (style, cum_data) in enumerate(style_cum_shortterm.items()):
         x_dates = mdates.date2num(cum_data.index.to_pydatetime())
         ax2.plot(x_dates, cum_data.values, linewidth=1.5, label=style, color=colors[i % len(colors)])
     
@@ -736,19 +818,9 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     ax2.tick_params(axis='x', rotation=90, labelsize=6)
     ax2.tick_params(axis='y', labelsize=6)
     ax2.legend(fontsize=6, loc='best', ncol=2, framealpha=0.9)
-    ax2.grid(False)
-    for spine in ax2.spines.values():
-        spine.set_visible(False)
+    style_axis(ax2)
     
-    # Chart title and formatting lines (stop at chart margin)
-    pos2 = ax2.get_position()
-    line_left2 = pos2.x0 - 0.02
-    line_right2 = pos2.x1 + 0.02
-    fig.add_artist(plt.Line2D([line_left2, line_right2], [pos2.y1 + 0.02, pos2.y1 + 0.02], color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
-    fig.add_artist(plt.Line2D([line_left2, line_right2], [pos2.y0 - 0.04, pos2.y0 - 0.04], color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
-    fig.text(line_left2, pos2.y1 + 0.025, 'Exhibit 2: Style Cumulative Q1-Q5 Outperformance (Since Jan 2024)', 
-             fontsize=9, fontweight='bold', ha='left')
-    fig.text(line_left2, pos2.y0 - 0.05, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
+    add_chart_frame(fig, ax2, f'Exhibit 2: Style Cumulative Q1-Q5 Outperformance ({shortterm_label})', bottom_offset=0.04)
     
     # Single unified write-up (right side, spanning both charts)
     bullets = [b.strip() for b in summary_writeup.replace('•', '-').split('\n') if b.strip().startswith('-')]
@@ -762,54 +834,52 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
                  linespacing=1.25, color='#006d77')
         text_y -= 0.016 * num_lines + 0.008  # Dynamic spacing based on line count
     
-    # Chart 3: All 22 factors 4Q'25 and 2025 Q1-Q5 OPF (full width)
-    ax3 = fig.add_axes([0.08, 0.14, 0.87, 0.22])
+    # Chart 3: All 22 factors YTD'26 (bars) and 2025 (dots) Q1-Q5 OPF (full width)
+    ax3 = fig.add_axes([0.08, 0.14, 0.82, 0.22])
     
-    # Sort factors by 4Q OPF (high to low)
-    sorted_factors = sorted(factor_4q_opf.keys(), key=lambda f: factor_4q_opf.get(f, 0), reverse=True)
+    # Sort factors by YTD OPF (high to low)
+    sorted_factors = sorted(factor_ytd_opf.keys(), key=lambda f: factor_ytd_opf.get(f, 0), reverse=True)
     x_pos3 = np.arange(len(sorted_factors))
-    q4_vals3 = [factor_4q_opf.get(f, 0) for f in sorted_factors]
     ytd_vals3 = [factor_ytd_opf.get(f, 0) for f in sorted_factors]
+    prev_year_vals3 = [factor_prev_year_opf.get(f, 0) for f in sorted_factors]
     
-    # Determine if we need dual axis
-    q4_range3 = max(abs(min(q4_vals3)), abs(max(q4_vals3))) if q4_vals3 else 0.1
-    ytd_range3 = max(abs(min(ytd_vals3)), abs(max(ytd_vals3))) if ytd_vals3 else 0.1
-    use_dual_axis3 = abs(q4_range3 - ytd_range3) / max(q4_range3, ytd_range3) > 0.5
+    # Filter out NaN values for axis limits
+    ytd_vals3_valid = [v for v in ytd_vals3 if not np.isnan(v)]
+    prev_year_vals3_valid = [v for v in prev_year_vals3 if not np.isnan(v)]
     
-    bars3 = ax3.bar(x_pos3, q4_vals3, width=0.6, color='steelblue', alpha=0.8)
+    # Always use dual axis for clarity
+    bars3 = ax3.bar(x_pos3, ytd_vals3, width=0.6, color='steelblue', alpha=0.8)
     ax3.axhline(0, color='#d0d2d6', linewidth=0.8)
     ax3.set_xticks(x_pos3)
     ax3.set_xticklabels(sorted_factors, rotation=90, ha='center', fontsize=6)
-    ax3.set_ylabel("4Q'25 Q1-Q5 OPF (%)", fontsize=7, color='black')
+    ax3.set_ylabel(f"{ytd_label} Q1-Q5 OPF (%)", fontsize=7, color='black')
     ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
     ax3.tick_params(axis='y', labelsize=6, colors='black')
     ax3.grid(False)
     
-    if use_dual_axis3:
-        ax3b = ax3.twinx()
-        ax3b.scatter(x_pos3, ytd_vals3, color='darkorange', s=15, zorder=5)
-        ax3b.set_ylabel('2025 Q1-Q5 OPF (%)', fontsize=7, color='black')
-        ax3b.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
-        ax3b.tick_params(axis='y', labelsize=6, colors='black')
-        ax3b.grid(False)
-        # Align zero on both axes with proportional scaling
-        y3_abs_max = max(abs(min(q4_vals3)), abs(max(q4_vals3))) * 1.15
-        y3b_abs_max = max(abs(min(ytd_vals3)), abs(max(ytd_vals3))) * 1.15
-        ax3.set_ylim(-y3_abs_max, y3_abs_max)
-        ax3b.set_ylim(-y3b_abs_max, y3b_abs_max)
-        for spine in ax3b.spines.values():
-            spine.set_visible(False)
-    else:
-        ax3.scatter(x_pos3, ytd_vals3, color='darkorange', s=15, zorder=5)
+    # Add dots for 2025 OPF on RHS axis
+    ax3b = ax3.twinx()
+    ax3b.scatter(x_pos3, prev_year_vals3, color='darkorange', s=15, zorder=5)
+    ax3b.set_ylabel(f'{prev_year_label} Q1-Q5 OPF (%)', fontsize=7, color='black')
+    ax3b.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
+    ax3b.tick_params(axis='y', labelsize=6, colors='black')
+    ax3b.grid(False)
+    # Set appropriate y-axis limits (handle empty/NaN cases)
+    ytd_abs_max3 = max(abs(min(ytd_vals3_valid)), abs(max(ytd_vals3_valid))) * 1.15 if ytd_vals3_valid else 0.1
+    prev_year_abs_max3 = max(abs(min(prev_year_vals3_valid)), abs(max(prev_year_vals3_valid))) * 1.15 if prev_year_vals3_valid else 0.1
+    ax3.set_ylim(-ytd_abs_max3, ytd_abs_max3)
+    ax3b.set_ylim(-prev_year_abs_max3, prev_year_abs_max3)
+    for spine in ax3b.spines.values():
+        spine.set_visible(False)
     
     ax3.set_xlim(-0.5, len(sorted_factors) - 0.5)
     for spine in ax3.spines.values():
         spine.set_visible(False)
     
     # Legend for chart 3
-    legend_elements3 = [plt.Rectangle((0,0),1,1, color='steelblue', alpha=0.8, label="4Q'25"),
+    legend_elements3 = [plt.Rectangle((0,0),1,1, color='steelblue', alpha=0.8, label=ytd_label),
                         Line2D([0], [0], marker='o', color='w', markerfacecolor='darkorange', 
-                               markersize=8, label='2025 (RHS)')]
+                               markersize=8, label=f'{prev_year_label} (RHS)')]
     ax3.legend(handles=legend_elements3, loc='upper right', fontsize=6, framealpha=0.9)
     
     # Chart title and formatting lines (full width including y-axis labels)
@@ -818,7 +888,7 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     line_right3 = pos3.x1 + 0.02
     fig.add_artist(plt.Line2D([line_left3, line_right3], [pos3.y1 + 0.02, pos3.y1 + 0.02], color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
     fig.add_artist(plt.Line2D([line_left3, line_right3], [pos3.y0 - 0.08, pos3.y0 - 0.08], color='#d0d2d6', linewidth=0.8, transform=fig.transFigure))
-    fig.text(line_left3, pos3.y1 + 0.025, f"Exhibit 3: Individual Factor Q1-Q5 Outperformance — 4Q'{str(current_year)[-2:]} vs {current_year}", 
+    fig.text(line_left3, pos3.y1 + 0.025, f"Exhibit 3: Individual Factor Q1-Q5 Outperformance — {ytd_label} vs {prev_year_label}", 
              fontsize=9, fontweight='bold', ha='left')
     fig.text(line_left3, pos3.y0 - 0.09, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
     
@@ -828,72 +898,44 @@ with PdfPages("Factor_Backtest_Report.pdf") as pdf:
     print(" → Added summary page 1")
     
     # ==========================================================================
-    # SUMMARY PAGE 2 - Long-term Performance
+    # SUMMARY PAGE 2 - Long-term Performance (using pre-computed data)
     # ==========================================================================
     
-    # Calculate long-term data since 2021
-    since_2021 = pd.Timestamp('2021-01-01')
-    style_cum_since_2021 = {}
-    style_hitrate = {}
-    factor_ann_opf = {}
-    
-    for factor in factors:
-        monthly, universe, temp = prepare_factor_data(df, factor, shift_dates=False)
-        if monthly is None:
-            continue
-        
-        q1_q5 = monthly['Q1'] - monthly['Q5']
-        data_since_2021 = q1_q5[q1_q5.index >= since_2021]
-        
-        if factor in mfr_names:
-            # Cumulative since 2021
-            if len(data_since_2021) > 0:
-                cum_q1_q5 = (1 + data_since_2021).cumprod() - 1
-                start_date = data_since_2021.index.min() - pd.offsets.MonthEnd(1)
-                cum_q1_q5 = pd.concat([pd.Series([0.0], index=[start_date]), cum_q1_q5])
-                style_cum_since_2021[factor] = cum_q1_q5
-            
-            # Hit rate since 2021
-            if len(data_since_2021) > 0:
-                style_hitrate[factor] = (data_since_2021 > 0).mean()
-        else:
-            # Annualized OPF since 2021 for individual factors
-            if len(data_since_2021) >= 12:
-                total_return = (1 + data_since_2021).prod() - 1
-                n_years = len(data_since_2021) / 12
-                ann_opf = (1 + total_return) ** (1 / n_years) - 1
-                factor_ann_opf[factor] = ann_opf
-    
-    # Generate page 2 write-up
-    sorted_cum = sorted(style_cum_since_2021.items(), key=lambda x: x[1].iloc[-1] if len(x[1]) > 0 else 0, reverse=True)
-    best_cum_styles = [s for s, _ in sorted_cum[:3]]
-    worst_cum_styles = [s for s, _ in sorted_cum[-3:]]
+    # Generate page 2 write-up using pre-computed style_cum_longterm and style_hitrate
+    sorted_cum = sorted(style_cum_longterm.items(), key=lambda x: x[1].iloc[-1] if len(x[1]) > 0 else 0, reverse=True)
+    best_cum_style1 = sorted_cum[0][0] if len(sorted_cum) > 0 else "N/A"
+    best_cum_style2 = sorted_cum[1][0] if len(sorted_cum) > 1 else "N/A"
+    worst_cum_style = sorted_cum[-1][0] if len(sorted_cum) > 0 else "N/A"
     
     sorted_hitrate = sorted(style_hitrate.items(), key=lambda x: x[1], reverse=True)
-    high_hitrate = [(s, h) for s, h in sorted_hitrate if h > 0.5]
-    low_hitrate = [(s, h) for s, h in sorted_hitrate if h <= 0.5]
+    best_hitrate_style = sorted_hitrate[0][0] if len(sorted_hitrate) > 0 else "N/A"
+    best_hitrate_val = sorted_hitrate[0][1] if len(sorted_hitrate) > 0 else 0
+    worst_hitrate_style = sorted_hitrate[-1][0] if len(sorted_hitrate) > 0 else "N/A"
+    worst_hitrate_val = sorted_hitrate[-1][1] if len(sorted_hitrate) > 0 else 0
     
     sorted_factors_list = sorted(factor_ann_opf.items(), key=lambda x: x[1], reverse=True)
-    best_factors = [f for f, _ in sorted_factors_list[:3]]
-    worst_factors = [f for f, _ in sorted_factors_list[-3:]]
+    best_factor1 = sorted_factors_list[0][0] if len(sorted_factors_list) > 0 else "N/A"
+    best_factor2 = sorted_factors_list[1][0] if len(sorted_factors_list) > 1 else "N/A"
+    worst_factor1 = sorted_factors_list[-1][0] if len(sorted_factors_list) > 0 else "N/A"
+    worst_factor2 = sorted_factors_list[-2][0] if len(sorted_factors_list) > 1 else "N/A"
     
     page2_data = f"""
-Long-term Performance Data (Since Jan 2021):
+Long-term Performance Data ({longterm_label}):
 
-Best cumulative Q1-Q5 styles: {', '.join(best_cum_styles)}
-Worst cumulative Q1-Q5 styles: {', '.join(worst_cum_styles)}
+Best cumulative Q1-Q5 styles: {best_cum_style1}, {best_cum_style2}
+Worst cumulative Q1-Q5 style: {worst_cum_style}
 
-Hit rates above 50%: {', '.join([f"{s} ({h:.0%})" for s, h in high_hitrate])}
-Hit rates at or below 50%: {', '.join([f"{s} ({h:.0%})" for s, h in low_hitrate])}
+Highest hit rate: {best_hitrate_style} ({best_hitrate_val:.0%})
+Lowest hit rate: {worst_hitrate_style} ({worst_hitrate_val:.0%})
 
-Best annualized factors: {', '.join(best_factors)}
-Worst annualized factors: {', '.join(worst_factors)}
+Best annualized factors: {best_factor1}, {best_factor2}
+Worst annualized factors: {worst_factor1}, {worst_factor2}
 """
     
-    # AI write-up for page 2
-    page2_writeup = f"""- Since 2021, {best_cum_styles[0]} and {best_cum_styles[1]} styles have delivered the strongest Q1-Q5 outperformance, while {worst_cum_styles[0]} has lagged significantly.
-- Hit rate analysis shows {high_hitrate[0][0]} ({high_hitrate[0][1]:.0%}) delivers most consistent returns, while {low_hitrate[-1][0]} ({low_hitrate[-1][1]:.0%}) struggles to beat 50%.
-- Factor-level analysis favors {best_factors[0]} and {best_factors[1]} at the expense of {worst_factors[-1]} and {worst_factors[-2]}."""
+    # Template-based write-up using actual computed data
+    page2_writeup = f"""- {longterm_label}, {best_cum_style1} and {best_cum_style2} styles have delivered the strongest Q1-Q5 outperformance, while {worst_cum_style} has lagged significantly.
+- Hit rate analysis shows {best_hitrate_style} ({best_hitrate_val:.0%}) delivers most consistent returns, while {worst_hitrate_style} ({worst_hitrate_val:.0%}) is at the bottom.
+- Factor-level analysis favors {best_factor1} and {best_factor2} at the expense of {worst_factor1} and {worst_factor2}."""
     
     if USE_AI_WRITEUPS_PAGE2 and client:
         prompt_p2 = f"""You are a quantitative equity analyst. Based on this data:
@@ -921,11 +963,11 @@ Start each bullet with a dash. Be concise."""
     fig2.text(0.06, 0.95, 'S&P 500 - Style and factor long-term performance summary', fontsize=14, fontweight='bold', 
              ha='left', color='#006d77')
     
-    # Chart 1: Cumulative style Q1-Q5 outperformance since 2021 (narrower for text)
+    # Chart 1: Cumulative style Q1-Q5 outperformance (long-term)
     ax1 = fig2.add_axes([0.08, 0.72, 0.55, 0.16])
     
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    for i, (style, cum_data) in enumerate(style_cum_since_2021.items()):
+    for i, (style, cum_data) in enumerate(style_cum_longterm.items()):
         x_dates = mdates.date2num(cum_data.index.to_pydatetime())
         ax1.plot(x_dates, cum_data.values, linewidth=1.5, label=style, color=colors[i % len(colors)])
     
@@ -937,21 +979,11 @@ Start each bullet with a dash. Be concise."""
     ax1.tick_params(axis='x', rotation=90, labelsize=6)
     ax1.tick_params(axis='y', labelsize=6)
     ax1.legend(fontsize=5, loc='upper left', ncol=2, framealpha=0.9)
-    ax1.grid(False)
-    for spine in ax1.spines.values():
-        spine.set_visible(False)
+    style_axis(ax1)
     
-    # Chart 1 title and formatting
-    pos1 = ax1.get_position()
-    line_left = pos1.x0 - 0.02
-    line_right = pos1.x1 + 0.02
-    fig2.add_artist(plt.Line2D([line_left, line_right], [pos1.y1 + 0.02, pos1.y1 + 0.02], color='#d0d2d6', linewidth=0.8, transform=fig2.transFigure))
-    fig2.add_artist(plt.Line2D([line_left, line_right], [pos1.y0 - 0.04, pos1.y0 - 0.04], color='#d0d2d6', linewidth=0.8, transform=fig2.transFigure))
-    fig2.text(line_left, pos1.y1 + 0.025, 'Exhibit 4: Style Cumulative Q1-Q5 Outperformance (Since Jan 2021)', 
-             fontsize=9, fontweight='bold', ha='left')
-    fig2.text(line_left, pos1.y0 - 0.05, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
+    add_chart_frame(fig2, ax1, f'Exhibit 4: Style Cumulative Q1-Q5 Outperformance ({longterm_label})', bottom_offset=0.04)
     
-    # Chart 2: Style long-term Q1-Q5 hit rate (narrower for text)
+    # Chart 2: Style long-term Q1-Q5 hit rate
     ax2 = fig2.add_axes([0.08, 0.46, 0.55, 0.16])
     
     styles_sorted = [s for s, _ in sorted_hitrate]
@@ -966,19 +998,9 @@ Start each bullet with a dash. Be concise."""
     ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.0%}'))
     ax2.tick_params(axis='y', labelsize=6)
     ax2.set_ylim(0, 1)
-    ax2.grid(False)
-    for spine in ax2.spines.values():
-        spine.set_visible(False)
+    style_axis(ax2)
     
-    # Chart 2 title and formatting
-    pos2 = ax2.get_position()
-    line_left2 = pos2.x0 - 0.02
-    line_right2 = pos2.x1 + 0.02
-    fig2.add_artist(plt.Line2D([line_left2, line_right2], [pos2.y1 + 0.02, pos2.y1 + 0.02], color='#d0d2d6', linewidth=0.8, transform=fig2.transFigure))
-    fig2.add_artist(plt.Line2D([line_left2, line_right2], [pos2.y0 - 0.05, pos2.y0 - 0.05], color='#d0d2d6', linewidth=0.8, transform=fig2.transFigure))
-    fig2.text(line_left2, pos2.y1 + 0.025, 'Exhibit 5: Style Long-term Q1-Q5 Hit Rate (Since Jan 2021)', 
-             fontsize=9, fontweight='bold', ha='left')
-    fig2.text(line_left2, pos2.y0 - 0.06, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
+    add_chart_frame(fig2, ax2, f'Exhibit 5: Style Long-term Q1-Q5 Hit Rate ({longterm_label})', bottom_offset=0.05)
     
     # Page 2 write-up (right side, spanning both charts)
     bullets_p2 = [b.strip() for b in page2_writeup.replace('•', '-').split('\n') if b.strip().startswith('-')]
@@ -992,7 +1014,7 @@ Start each bullet with a dash. Be concise."""
                  linespacing=1.25, color='#006d77')
         text_y_p2 -= 0.016 * num_lines + 0.008
     
-    # Chart 3: Factor annualized Q1-Q5 outperformance since 2021
+    # Chart 3: Factor annualized Q1-Q5 outperformance (long-term)
     ax3 = fig2.add_axes([0.08, 0.14, 0.87, 0.22])
     
     sorted_factors_ann = sorted(factor_ann_opf.keys(), key=lambda f: factor_ann_opf.get(f, 0), reverse=True)
@@ -1006,20 +1028,10 @@ Start each bullet with a dash. Be concise."""
     ax3.set_ylabel('Annualized Q1-Q5 OPF (%)', fontsize=7)
     ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y:.1%}'))
     ax3.tick_params(axis='y', labelsize=6)
-    ax3.grid(False)
     ax3.set_xlim(-0.5, len(sorted_factors_ann) - 0.5)
-    for spine in ax3.spines.values():
-        spine.set_visible(False)
+    style_axis(ax3)
     
-    # Chart 3 title and formatting
-    pos3 = ax3.get_position()
-    line_left3 = pos3.x0 - 0.02
-    line_right3 = pos3.x1 + 0.02
-    fig2.add_artist(plt.Line2D([line_left3, line_right3], [pos3.y1 + 0.02, pos3.y1 + 0.02], color='#d0d2d6', linewidth=0.8, transform=fig2.transFigure))
-    fig2.add_artist(plt.Line2D([line_left3, line_right3], [pos3.y0 - 0.08, pos3.y0 - 0.08], color='#d0d2d6', linewidth=0.8, transform=fig2.transFigure))
-    fig2.text(line_left3, pos3.y1 + 0.025, 'Exhibit 6: Factor Annualized Q1-Q5 Outperformance (Since Jan 2021)', 
-             fontsize=9, fontweight='bold', ha='left')
-    fig2.text(line_left3, pos3.y0 - 0.09, 'Source: FactSet, S&P 500 data', fontsize=6, ha='left', style='italic')
+    add_chart_frame(fig2, ax3, f'Exhibit 6: Factor Annualized Q1-Q5 Outperformance ({longterm_label})', bottom_offset=0.08)
     
     add_footer(fig2)
     pdf.savefig(fig2)
@@ -1027,15 +1039,134 @@ Start each bullet with a dash. Be concise."""
     print(" → Added summary page 2")
     
     # ==========================================================================
-    # Q4 ATTRIBUTION ANALYSIS PAGE (Page 3)
+    # FACTOR CORRELATION & OVERLAP ANALYSIS PAGE (Page 3)
+    # Uses pre-computed factor_monthly_opf and factor_q1_members from main loop
     # ==========================================================================
     
-    # Get current quarter for dynamic title
-    latest_date = df['Date'].max()
-    q4_quarter = f"Q4'{latest_date.strftime('%y')}"
+    # Build correlation matrix
+    opf_df = pd.DataFrame(factor_monthly_opf)
+    corr_matrix = opf_df.corr()
     
-    # Q4 raw dates (Sep 30, Oct 31, Nov 30 -> Oct, Nov, Dec returns)
-    q4_raw_dates = pd.to_datetime(['2025-09-30', '2025-10-31', '2025-11-30'])
+    # Build Q1 overlap matrix (average monthly overlap %)
+    overlap_matrix = pd.DataFrame(index=individual_factors, columns=individual_factors, dtype=float)
+    
+    for f1 in individual_factors:
+        for f2 in individual_factors:
+            if f1 not in factor_q1_members or f2 not in factor_q1_members:
+                overlap_matrix.loc[f1, f2] = np.nan
+                continue
+            
+            q1_f1 = factor_q1_members[f1]
+            q1_f2 = factor_q1_members[f2]
+            
+            # Find common dates
+            common_dates = q1_f1.index.intersection(q1_f2.index)
+            
+            if len(common_dates) == 0:
+                overlap_matrix.loc[f1, f2] = np.nan
+                continue
+            
+            # Calculate average overlap
+            overlaps = []
+            for date in common_dates:
+                set1 = q1_f1.loc[date]
+                set2 = q1_f2.loc[date]
+                if len(set1) > 0 and len(set2) > 0:
+                    overlap_pct = len(set1 & set2) / min(len(set1), len(set2))
+                    overlaps.append(overlap_pct)
+            
+            overlap_matrix.loc[f1, f2] = np.mean(overlaps) if overlaps else np.nan
+    
+    # Create Page 3 with two heatmap tables
+    fig_corr = plt.figure(figsize=(8.27, 11.69))
+    fig_corr.text(0.06, 0.96, 'S&P 500 - Factor correlation and overlap metrics', fontsize=14, fontweight='bold', 
+             ha='left', color='#006d77')
+    
+    # Shorten factor names for display
+    short_names = {f: f[:8] if len(f) > 8 else f for f in individual_factors}
+    display_factors = [short_names[f] for f in individual_factors if f in corr_matrix.index]
+    
+    # Table 1: Correlation Matrix (top half - more space for x-axis labels)
+    ax_corr = fig_corr.add_axes([0.08, 0.56, 0.85, 0.32])
+    
+    # Filter to only factors in corr_matrix
+    valid_factors = [f for f in individual_factors if f in corr_matrix.index]
+    corr_subset = corr_matrix.loc[valid_factors, valid_factors].copy()
+    
+    # Set diagonal to NaN (remove self-comparison coloring)
+    for i in range(len(valid_factors)):
+        corr_subset.iloc[i, i] = np.nan
+    
+    # Create heatmap - scale to actual data range for better color variation
+    corr_min = corr_subset.min().min()
+    corr_max = corr_subset.max().max()
+    im1 = ax_corr.imshow(corr_subset.values, cmap='RdYlGn_r', aspect='auto', vmin=corr_min, vmax=corr_max)
+    
+    ax_corr.set_xticks(np.arange(len(valid_factors)))
+    ax_corr.set_yticks(np.arange(len(valid_factors)))
+    ax_corr.set_xticklabels([short_names[f] for f in valid_factors], rotation=90, fontsize=5, ha='center')
+    ax_corr.set_yticklabels([short_names[f] for f in valid_factors], fontsize=5)
+    ax_corr.grid(False)
+    for spine in ax_corr.spines.values():
+        spine.set_visible(False)
+    
+    # Add correlation values (all black font)
+    for i in range(len(valid_factors)):
+        for j in range(len(valid_factors)):
+            val = corr_subset.iloc[i, j]
+            if not np.isnan(val):
+                ax_corr.text(j, i, f'{val:.2f}', ha='center', va='center', fontsize=4, color='black')
+    
+    fig_corr.text(0.08, 0.895, 'Exhibit 7: Monthly Q1-Q5 Outperformance Correlation Matrix', 
+             fontsize=9, fontweight='bold')
+    fig_corr.text(0.08, 0.50, 'Source: FactSet, S&P 500 data. Green = low correlation (good for diversification)', 
+             fontsize=6, ha='left', style='italic')
+    
+    # Table 2: Overlap Matrix (bottom half)
+    ax_overlap = fig_corr.add_axes([0.08, 0.12, 0.85, 0.32])
+    
+    overlap_subset = overlap_matrix.loc[valid_factors, valid_factors].astype(float).copy()
+    
+    # Set diagonal to NaN (remove self-comparison coloring)
+    for i in range(len(valid_factors)):
+        overlap_subset.iloc[i, i] = np.nan
+    
+    # Create heatmap - scale to actual data range for better color variation
+    overlap_min = overlap_subset.min().min()
+    overlap_max = overlap_subset.max().max()
+    im2 = ax_overlap.imshow(overlap_subset.values, cmap='RdYlGn_r', aspect='auto', vmin=overlap_min, vmax=overlap_max)
+    
+    ax_overlap.set_xticks(np.arange(len(valid_factors)))
+    ax_overlap.set_yticks(np.arange(len(valid_factors)))
+    ax_overlap.set_xticklabels([short_names[f] for f in valid_factors], rotation=90, fontsize=5, ha='center')
+    ax_overlap.set_yticklabels([short_names[f] for f in valid_factors], fontsize=5)
+    ax_overlap.grid(False)
+    for spine in ax_overlap.spines.values():
+        spine.set_visible(False)
+    
+    # Add overlap values (all black font)
+    for i in range(len(valid_factors)):
+        for j in range(len(valid_factors)):
+            val = overlap_subset.iloc[i, j]
+            if not np.isnan(val):
+                ax_overlap.text(j, i, f'{val:.0%}', ha='center', va='center', fontsize=4, color='black')
+    
+    fig_corr.text(0.08, 0.455, 'Exhibit 8: Average Monthly Q1 Overlap Matrix', 
+             fontsize=9, fontweight='bold')
+    fig_corr.text(0.08, 0.06, 'Source: FactSet, S&P 500 data. Green = low overlap (good for diversification)', 
+             fontsize=6, ha='left', style='italic')
+    
+    add_footer(fig_corr)
+    pdf.savefig(fig_corr)
+    plt.close()
+    print(" → Added factor correlation & overlap page (page 3)")
+    
+    # ==========================================================================
+    # Q4 ATTRIBUTION ANALYSIS PAGE (Page 4)
+    # Uses q4_raw_dates already defined dynamically based on prev_year
+    # ==========================================================================
+    
+    q4_quarter = f"Q4'{str(prev_year)[-2:]}"
     df_q4 = df[df['Date'].isin(q4_raw_dates)].copy()
     
     def analyze_mfr_q1(df_subset, factor_list):
@@ -1068,16 +1199,16 @@ Start each bullet with a dash. Be concise."""
     garp_q1 = analyze_mfr_q1(df_q4, ['PEGYLD', 'PSGYLD'])
     lowrisk_q1 = analyze_mfr_q1(df_q4, ['LowBETA', 'LowVol'])
     
-    # Aggregate stock data
+    # Aggregate stock data with dynamic year formatting
+    year_short = f"'{str(prev_year)[-2:]}"
+    
     def format_months_short(months_list):
-        months_sorted = sorted(set(months_list))
-        if len(months_sorted) == 3:
-            return "Oct, Nov, Dec'25"
-        elif len(months_sorted) == 2:
-            short_names = [m.replace(' 2025', "'25").replace('Oct ', 'Oct').replace('Nov ', 'Nov').replace('Dec ', 'Dec') for m in months_sorted]
-            return ', '.join([s.split()[0] if ' ' in s else s[:3] for s in months_sorted]).replace(' 2025', '') + "'25"
-        else:
-            return months_sorted[0].replace(' 2025', "'25")
+        months_set = set(months_list)
+        month_order = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+                       'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+        months_sorted = sorted(months_set, key=lambda m: month_order.get(m.split()[0], 0))
+        month_names = [m.split()[0] for m in months_sorted]
+        return ', '.join(month_names) + year_short
     
     def get_stock_summary(q1_data):
         stock_agg = q1_data.groupby(['Symbol', 'Name', 'GICSL1']).agg({
@@ -1139,7 +1270,7 @@ Start each bullet with a dash. Be concise."""
             cell.set_facecolor('#f0f7f7' if i % 2 == 0 else 'white')
             cell.set_edgecolor('#d0d2d6')
     
-    fig3.text(0.06, 0.89, f'Exhibit 7: GARP Q1 Key Performers ({q4_quarter})', fontsize=9, fontweight='bold')
+    fig3.text(0.06, 0.89, f'Exhibit 9: GARP Q1 Key Performers ({q4_quarter})', fontsize=9, fontweight='bold')
     
     # Table 2: GARP Q1 Sector Contribution (top right)
     ax2 = fig3.add_axes([0.52, 0.60, 0.42, 0.28])
@@ -1168,7 +1299,7 @@ Start each bullet with a dash. Be concise."""
             cell.set_facecolor('#f0f7f7' if i % 2 == 0 else 'white')
             cell.set_edgecolor('#d0d2d6')
     
-    fig3.text(0.52, 0.89, f'Exhibit 8: GARP Q1 Sector Contribution ({q4_quarter})', fontsize=9, fontweight='bold')
+    fig3.text(0.52, 0.89, f'Exhibit 10: GARP Q1 Sector Contribution ({q4_quarter})', fontsize=9, fontweight='bold')
     
     # Table 3: Low Risk Q1 Key Laggards (bottom left)
     ax3_attr = fig3.add_axes([0.06, 0.18, 0.42, 0.28])
@@ -1198,7 +1329,7 @@ Start each bullet with a dash. Be concise."""
             cell.set_facecolor('#f0f7f7' if i % 2 == 0 else 'white')
             cell.set_edgecolor('#d0d2d6')
     
-    fig3.text(0.06, 0.47, f'Exhibit 9: Low Risk Q1 Key Laggards ({q4_quarter})', fontsize=9, fontweight='bold')
+    fig3.text(0.06, 0.47, f'Exhibit 11: Low Risk Q1 Key Laggards ({q4_quarter})', fontsize=9, fontweight='bold')
     
     # Table 4: Low Risk Q1 Sector Contribution (bottom right)
     ax4 = fig3.add_axes([0.52, 0.18, 0.42, 0.28])
@@ -1227,7 +1358,7 @@ Start each bullet with a dash. Be concise."""
             cell.set_facecolor('#f0f7f7' if i % 2 == 0 else 'white')
             cell.set_edgecolor('#d0d2d6')
     
-    fig3.text(0.52, 0.47, f'Exhibit 10: Low Risk Q1 Sector Contribution ({q4_quarter})', fontsize=9, fontweight='bold')
+    fig3.text(0.52, 0.47, f'Exhibit 12: Low Risk Q1 Sector Contribution ({q4_quarter})', fontsize=9, fontweight='bold')
     
     # Source footer
     fig3.text(0.06, 0.06, 'Source: FactSet, S&P 500 data. Sector avg return = simple average of all stock-month observations in Q1.', 
